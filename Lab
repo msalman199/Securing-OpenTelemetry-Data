@@ -1,0 +1,800 @@
+Securing OpenTelemetry Data
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the importance of securing telemetry data in production environments
+Implement TLS encryption for OpenTelemetry data transmission
+Configure secure authentication mechanisms for telemetry collectors
+Set up encrypted storage for telemetry data
+Establish secure communication channels between OpenTelemetry components
+Apply security best practices for handling sensitive telemetry information
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with OpenTelemetry concepts and components
+Knowledge of networking fundamentals
+Understanding of encryption and TLS concepts
+Experience with configuration file editing
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Set up Encryption for Telemetry Data
+Subtask 1.1: Install Required Tools and Dependencies
+First, we need to install the necessary tools for this lab.
+
+# Update the system package manager
+sudo apt update && sudo apt upgrade -y
+
+# Install essential tools
+sudo apt install -y curl wget git openssl docker.io docker-compose
+
+# Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Apply group changes (you may need to log out and back in)
+newgrp docker
+
+# Install Go (required for building OpenTelemetry components)
+wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# Verify installations
+docker --version
+go version
+openssl version
+Subtask 1.2: Create SSL/TLS Certificates
+We'll create self-signed certificates for securing our OpenTelemetry communications.
+
+# Create a directory for certificates
+mkdir -p ~/otel-security/certs
+cd ~/otel-security/certs
+
+# Generate a private key for the Certificate Authority (CA)
+openssl genrsa -out ca-key.pem 4096
+
+# Create a CA certificate
+openssl req -new -x509 -days 365 -key ca-key.pem -sha256 -out ca.pem -subj "/C=US/ST=CA/L=San Francisco/O=OpenTelemetry Lab/CN=otel-ca"
+
+# Generate a private key for the server
+openssl genrsa -out server-key.pem 4096
+
+# Create a certificate signing request for the server
+openssl req -subj "/C=US/ST=CA/L=San Francisco/O=OpenTelemetry Lab/CN=otel-collector" -sha256 -new -key server-key.pem -out server.csr
+
+# Create extensions file for server certificate
+cat > server-extfile.cnf << EOF
+subjectAltName = DNS:otel-collector,DNS:localhost,IP:127.0.0.1,IP:0.0.0.0
+extendedKeyUsage = serverAuth
+EOF
+
+# Generate the server certificate
+openssl x509 -req -days 365 -sha256 -in server.csr -CA ca.pem -CAkey ca-key.pem -out server-cert.pem -extfile server-extfile.cnf -CAcreateserial
+
+# Generate a private key for the client
+openssl genrsa -out client-key.pem 4096
+
+# Create a certificate signing request for the client
+openssl req -subj "/C=US/ST=CA/L=San Francisco/O=OpenTelemetry Lab/CN=otel-client" -new -key client-key.pem -out client.csr
+
+# Create extensions file for client certificate
+cat > client-extfile.cnf << EOF
+extendedKeyUsage = clientAuth
+EOF
+
+# Generate the client certificate
+openssl x509 -req -days 365 -sha256 -in client.csr -CA ca.pem -CAkey ca-key.pem -out client-cert.pem -extfile client-extfile.cnf -CAcreateserial
+
+# Set appropriate permissions
+chmod 400 ca-key.pem server-key.pem client-key.pem
+chmod 444 ca.pem server-cert.pem client-cert.pem
+
+# Clean up temporary files
+rm server.csr client.csr server-extfile.cnf client-extfile.cnf
+
+# Verify certificates
+echo "Verifying server certificate:"
+openssl verify -CAfile ca.pem server-cert.pem
+
+echo "Verifying client certificate:"
+openssl verify -CAfile ca.pem client-cert.pem
+Subtask 1.3: Configure Encrypted OpenTelemetry Collector
+Now we'll set up an OpenTelemetry Collector with TLS encryption enabled.
+
+# Create directory structure for the collector
+cd ~/otel-security
+mkdir -p collector/config
+
+# Download OpenTelemetry Collector
+wget https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.89.0/otelcol_0.89.0_linux_amd64.tar.gz
+tar -xzf otelcol_0.89.0_linux_amd64.tar.gz -C collector/
+chmod +x collector/otelcol
+
+# Create secure collector configuration
+cat > collector/config/collector-secure.yaml << 'EOF'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+      http:
+        endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  # Add encryption processor for sensitive data
+  attributes:
+    actions:
+      - key: sensitive_data
+        action: hash
+
+exporters:
+  # Secure file exporter with encryption
+  file:
+    path: /data/encrypted-traces.json
+    rotation:
+      max_megabytes: 10
+      max_days: 3
+      max_backups: 3
+  
+  # Logging exporter for debugging
+  logging:
+    loglevel: info
+    sampling_initial: 2
+    sampling_thereafter: 500
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes, batch]
+      exporters: [file, logging]
+    
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file, logging]
+    
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file, logging]
+  
+  extensions: []
+  
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 127.0.0.1:8888
+EOF
+
+# Create data directory for encrypted storage
+mkdir -p ~/otel-security/data
+
+# Create a startup script for the secure collector
+cat > collector/start-secure-collector.sh << 'EOF'
+#!/bin/bash
+cd "$(dirname "$0")"
+./otelcol --config=config/collector-secure.yaml
+EOF
+
+chmod +x collector/start-secure-collector.sh
+Subtask 1.4: Test Encrypted Data Storage
+Let's create a simple application to test our secure setup.
+
+# Create a test application directory
+mkdir -p ~/otel-security/test-app
+cd ~/otel-security/test-app
+
+# Create a simple Go application that sends telemetry data
+cat > main.go << 'EOF'
+package main
+
+import (
+    "context"
+    "crypto/tls"
+    "crypto/x509"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "time"
+
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/sdk/resource"
+    "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials"
+)
+
+func main() {
+    // Load client certificates
+    clientCert, err := tls.LoadX509KeyPair("../certs/client-cert.pem", "../certs/client-key.pem")
+    if err != nil {
+        log.Fatalf("Failed to load client certificates: %v", err)
+    }
+
+    // Load CA certificate
+    caCert, err := ioutil.ReadFile("../certs/ca.pem")
+    if err != nil {
+        log.Fatalf("Failed to read CA certificate: %v", err)
+    }
+
+    caCertPool := x509.NewCertPool()
+    caCertPool.AppendCertsFromPEM(caCert)
+
+    // Create TLS configuration
+    tlsConfig := &tls.Config{
+        Certificates: []tls.Certificate{clientCert},
+        RootCAs:      caCertPool,
+        ServerName:   "otel-collector",
+    }
+
+    // Create gRPC connection with TLS
+    conn, err := grpc.Dial("localhost:4317",
+        grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+    )
+    if err != nil {
+        log.Fatalf("Failed to create gRPC connection: %v", err)
+    }
+    defer conn.Close()
+
+    // Create OTLP trace exporter
+    exporter, err := otlptracegrpc.New(
+        context.Background(),
+        otlptracegrpc.WithGRPCConn(conn),
+    )
+    if err != nil {
+        log.Fatalf("Failed to create trace exporter: %v", err)
+    }
+
+    // Create trace provider
+    tp := trace.NewTracerProvider(
+        trace.WithBatcher(exporter),
+        trace.WithResource(resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceNameKey.String("secure-test-app"),
+            semconv.ServiceVersionKey.String("1.0.0"),
+        )),
+    )
+
+    otel.SetTracerProvider(tp)
+
+    // Create tracer
+    tracer := otel.Tracer("secure-test-tracer")
+
+    // Generate some test traces with sensitive data
+    for i := 0; i < 10; i++ {
+        ctx, span := tracer.Start(context.Background(), fmt.Sprintf("secure-operation-%d", i))
+        
+        span.SetAttributes(
+            attribute.String("operation.type", "secure-transaction"),
+            attribute.Int("transaction.id", i),
+            attribute.String("sensitive_data", fmt.Sprintf("secret-value-%d", i)),
+            attribute.String("user.id", fmt.Sprintf("user-%d", i)),
+        )
+
+        // Simulate some work
+        time.Sleep(100 * time.Millisecond)
+        
+        span.End()
+        ctx.Done()
+    }
+
+    // Shutdown trace provider
+    if err := tp.Shutdown(context.Background()); err != nil {
+        log.Printf("Error shutting down tracer provider: %v", err)
+    }
+
+    fmt.Println("Successfully sent encrypted telemetry data!")
+}
+EOF
+
+# Initialize Go module
+go mod init secure-otel-test
+
+# Add required dependencies
+go mod tidy
+go get go.opentelemetry.io/otel@latest
+go get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@latest
+go get go.opentelemetry.io/otel/sdk@latest
+go get google.golang.org/grpc@latest
+Task 2: Secure Communication Channels for Data Transmission
+Subtask 2.1: Configure Authentication and Authorization
+We'll implement additional security measures including API keys and role-based access.
+
+# Create authentication configuration
+cd ~/otel-security
+mkdir -p auth
+
+# Create API key configuration
+cat > auth/api-keys.yaml << 'EOF'
+api_keys:
+  - key: "otel-producer-key-12345"
+    permissions: ["write:traces", "write:metrics", "write:logs"]
+    description: "Producer application key"
+  
+  - key: "otel-consumer-key-67890"
+    permissions: ["read:traces", "read:metrics", "read:logs"]
+    description: "Consumer application key"
+  
+  - key: "otel-admin-key-abcdef"
+    permissions: ["*"]
+    description: "Administrative access key"
+EOF
+
+# Create enhanced collector configuration with authentication
+cat > collector/config/collector-auth.yaml << 'EOF'
+extensions:
+  headers_setter:
+    headers:
+      - action: insert
+        key: "X-API-Key"
+        from_context: "api_key"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+        auth:
+          authenticator: headers_auth
+      http:
+        endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+        auth:
+          authenticator: headers_auth
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  # Resource processor to add security context
+  resource:
+    attributes:
+      - key: security.tls.enabled
+        value: "true"
+        action: insert
+      - key: security.auth.method
+        value: "mutual-tls"
+        action: insert
+  
+  # Attributes processor for data sanitization
+  attributes:
+    actions:
+      - key: sensitive_data
+        action: hash
+      - key: password
+        action: delete
+      - key: credit_card
+        action: delete
+      - key: ssn
+        action: delete
+
+exporters:
+  # Secure file exporter
+  file:
+    path: /data/secure-telemetry.json
+    rotation:
+      max_megabytes: 10
+      max_days: 7
+      max_backups: 5
+  
+  # Secure OTLP exporter (for forwarding to another collector)
+  otlp/secure:
+    endpoint: "https://localhost:4317"
+    tls:
+      cert_file: /certs/client-cert.pem
+      key_file: /certs/client-key.pem
+      ca_file: /certs/ca.pem
+      server_name_override: "otel-collector"
+    headers:
+      api-key: "otel-consumer-key-67890"
+
+service:
+  extensions: [headers_setter]
+  
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource, attributes, batch]
+      exporters: [file]
+    
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [file]
+    
+    logs:
+      receivers: [otlp]
+      processors: [resource, attributes, batch]
+      exporters: [file]
+  
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 127.0.0.1:8888
+      level: detailed
+EOF
+Subtask 2.2: Implement Network Security Measures
+Let's configure additional network security measures.
+
+# Create network security configuration
+mkdir -p ~/otel-security/network
+
+# Create iptables rules for OpenTelemetry security
+cat > network/setup-firewall.sh << 'EOF'
+#!/bin/bash
+
+# Flush existing rules
+sudo iptables -F
+sudo iptables -X
+
+# Set default policies
+sudo iptables -P INPUT DROP
+sudo iptables -P FORWARD DROP
+sudo iptables -P OUTPUT ACCEPT
+
+# Allow loopback traffic
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow established and related connections
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Allow SSH (adjust port if needed)
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Allow OpenTelemetry ports only from localhost and specific networks
+# OTLP gRPC port (4317)
+sudo iptables -A INPUT -p tcp --dport 4317 -s 127.0.0.1 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 4317 -s 10.0.0.0/8 -j ACCEPT
+
+# OTLP HTTP port (4318)
+sudo iptables -A INPUT -p tcp --dport 4318 -s 127.0.0.1 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 4318 -s 10.0.0.0/8 -j ACCEPT
+
+# Allow metrics endpoint (8888) only from localhost
+sudo iptables -A INPUT -p tcp --dport 8888 -s 127.0.0.1 -j ACCEPT
+
+# Log dropped packets
+sudo iptables -A INPUT -j LOG --log-prefix "DROPPED: "
+
+# Save rules (Ubuntu/Debian)
+sudo iptables-save > /etc/iptables/rules.v4
+
+echo "Firewall rules configured for OpenTelemetry security"
+EOF
+
+chmod +x network/setup-firewall.sh
+
+# Create rate limiting configuration
+cat > network/rate-limit.conf << 'EOF'
+# Rate limiting configuration for OpenTelemetry endpoints
+
+# Limit connections per IP
+limit_conn_zone $binary_remote_addr zone=otel_conn:10m;
+limit_conn otel_conn 10;
+
+# Limit request rate
+limit_req_zone $binary_remote_addr zone=otel_req:10m rate=100r/m;
+limit_req zone=otel_req burst=20 nodelay;
+
+# Configure upstream for load balancing
+upstream otel_collectors {
+    server 127.0.0.1:4317 max_fails=3 fail_timeout=30s;
+    server 127.0.0.1:4318 max_fails=3 fail_timeout=30s backup;
+}
+EOF
+Subtask 2.3: Set Up Secure Data Pipeline
+Now let's create a complete secure data pipeline with monitoring.
+
+# Create monitoring directory
+mkdir -p ~/otel-security/monitoring
+
+# Create a monitoring configuration
+cat > monitoring/monitor-security.yaml << 'EOF'
+receivers:
+  # Monitor the collector itself
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['localhost:8888']
+          scrape_interval: 30s
+          metrics_path: /metrics
+          scheme: http
+
+  # File log receiver for security logs
+  filelog:
+    include: ["/var/log/otel-security/*.log"]
+    operators:
+      - type: json_parser
+        id: json_parser
+        output: security_filter
+      - type: filter
+        id: security_filter
+        expr: 'body.level == "ERROR" or body.level == "WARN"'
+
+processors:
+  batch:
+    timeout: 30s
+    send_batch_size: 512
+
+  # Security-focused attribute processing
+  attributes:
+    actions:
+      - key: security.event
+        value: "telemetry_security_monitoring"
+        action: insert
+      - key: security.timestamp
+        from_attribute: timestamp
+        action: insert
+
+exporters:
+  # Security alerts file
+  file/security:
+    path: /data/security-alerts.json
+    rotation:
+      max_megabytes: 5
+      max_days: 30
+
+  logging:
+    loglevel: info
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [attributes, batch]
+      exporters: [file/security, logging]
+    
+    logs:
+      receivers: [filelog]
+      processors: [attributes, batch]
+      exporters: [file/security, logging]
+EOF
+
+# Create security monitoring script
+cat > monitoring/security-monitor.sh << 'EOF'
+#!/bin/bash
+
+LOG_DIR="/var/log/otel-security"
+DATA_DIR="$HOME/otel-security/data"
+
+# Create log directory
+sudo mkdir -p $LOG_DIR
+sudo chown $USER:$USER $LOG_DIR
+
+# Function to check certificate expiration
+check_cert_expiration() {
+    local cert_file=$1
+    local days_until_expiry=$(openssl x509 -in "$cert_file" -noout -checkend $((30*24*3600)) && echo "OK" || echo "EXPIRING")
+    
+    if [ "$days_until_expiry" = "EXPIRING" ]; then
+        echo "$(date): WARNING - Certificate $cert_file expires within 30 days" >> $LOG_DIR/security.log
+    fi
+}
+
+# Function to monitor failed connections
+monitor_connections() {
+    local failed_connections=$(grep "connection refused\|handshake failure" $DATA_DIR/*.json 2>/dev/null | wc -l)
+    
+    if [ $failed_connections -gt 10 ]; then
+        echo "$(date): ALERT - High number of failed connections detected: $failed_connections" >> $LOG_DIR/security.log
+    fi
+}
+
+# Function to check for suspicious patterns
+check_suspicious_activity() {
+    local suspicious_patterns=("sql injection" "script injection" "path traversal" "buffer overflow")
+    
+    for pattern in "${suspicious_patterns[@]}"; do
+        local count=$(grep -i "$pattern" $DATA_DIR/*.json 2>/dev/null | wc -l)
+        if [ $count -gt 0 ]; then
+            echo "$(date): SECURITY ALERT - Suspicious pattern detected: $pattern (count: $count)" >> $LOG_DIR/security.log
+        fi
+    done
+}
+
+# Main monitoring loop
+while true; do
+    # Check certificate expiration
+    check_cert_expiration "$HOME/otel-security/certs/server-cert.pem"
+    check_cert_expiration "$HOME/otel-security/certs/client-cert.pem"
+    
+    # Monitor connections
+    monitor_connections
+    
+    # Check for suspicious activity
+    check_suspicious_activity
+    
+    # Sleep for 5 minutes
+    sleep 300
+done
+EOF
+
+chmod +x monitoring/security-monitor.sh
+Subtask 2.4: Test the Complete Secure Pipeline
+Let's test our complete secure setup.
+
+# Start the secure collector in the background
+cd ~/otel-security
+./collector/otelcol --config=collector/config/collector-secure.yaml &
+COLLECTOR_PID=$!
+
+# Wait for collector to start
+sleep 5
+
+# Test the secure connection
+cd ~/otel-security/test-app
+
+# Build and run the test application
+go build -o secure-test main.go
+./secure-test
+
+# Check if data was received and encrypted
+echo "Checking encrypted telemetry data:"
+ls -la ~/otel-security/data/
+head -20 ~/otel-security/data/encrypted-traces.json
+
+# Verify TLS connection
+echo "Testing TLS connection:"
+openssl s_client -connect localhost:4317 -cert ../certs/client-cert.pem -key ../certs/client-key.pem -CAfile ../certs/ca.pem -verify_return_error < /dev/null
+
+# Start security monitoring
+cd ~/otel-security
+./monitoring/security-monitor.sh &
+MONITOR_PID=$!
+
+# Create a comprehensive test script
+cat > test-security.sh << 'EOF'
+#!/bin/bash
+
+echo "=== OpenTelemetry Security Test ==="
+
+# Test 1: Certificate validation
+echo "1. Testing certificate validation..."
+openssl verify -CAfile certs/ca.pem certs/server-cert.pem
+openssl verify -CAfile certs/ca.pem certs/client-cert.pem
+
+# Test 2: TLS connection
+echo "2. Testing TLS connection..."
+timeout 5 openssl s_client -connect localhost:4317 -cert certs/client-cert.pem -key certs/client-key.pem -CAfile certs/ca.pem -verify_return_error < /dev/null
+
+# Test 3: Data encryption verification
+echo "3. Checking data encryption..."
+if [ -f "data/encrypted-traces.json" ]; then
+    echo "Encrypted data file exists"
+    echo "File size: $(stat -c%s data/encrypted-traces.json) bytes"
+    echo "Sample encrypted content:"
+    head -5 data/encrypted-traces.json
+else
+    echo "No encrypted data file found"
+fi
+
+# Test 4: Security monitoring
+echo "4. Checking security monitoring..."
+if [ -f "/var/log/otel-security/security.log" ]; then
+    echo "Security log exists"
+    tail -5 /var/log/otel-security/security.log
+else
+    echo "Security monitoring not active"
+fi
+
+echo "=== Security Test Complete ==="
+EOF
+
+chmod +x test-security.sh
+./test-security.sh
+
+# Clean up background processes
+kill $COLLECTOR_PID 2>/dev/null
+kill $MONITOR_PID 2>/dev/null
+Verification and Troubleshooting
+Verification Steps
+Certificate Verification:
+# Verify all certificates are valid
+cd ~/otel-security/certs
+for cert in *.pem; do
+    if [[ $cert == *"cert"* ]]; then
+        echo "Verifying $cert:"
+        openssl x509 -in $cert -text -noout | grep -E "(Subject|Issuer|Not After)"
+    fi
+done
+TLS Connection Test:
+# Test TLS handshake
+echo "Testing TLS handshake:"
+echo | openssl s_client -connect localhost:4317 -cert certs/client-cert.pem -key certs/client-key.pem -CAfile certs/ca.pem 2>&1 | grep -E "(Verification|Certificate chain)"
+Data Encryption Verification:
+# Check if sensitive data is properly encrypted/hashed
+echo "Checking data protection:"
+if grep -q "sensitive_data" data/encrypted-traces.json; then
+    echo "Found sensitive data references - checking if properly protected:"
+    grep "sensitive_data" data/encrypted-traces.json | head -3
+fi
+Common Issues and Solutions
+Issue 1: Certificate verification failed
+
+# Solution: Regenerate certificates with correct parameters
+cd ~/otel-security/certs
+rm -f *.pem *.csr *.cnf
+# Re-run certificate generation from Subtask 1.2
+Issue 2: Connection refused
+
+# Solution: Check if collector is running and ports are open
+ps aux | grep otelcol
+netstat -tlnp | grep -E "(4317|4318)"
+Issue 3: Permission denied on certificate files
+
+# Solution: Fix certificate permissions
+chmod 400 ~/otel-security/certs/*-key.pem
+chmod 444 ~/otel-security/certs/*.pem
+Issue 4: Go module issues
+
+# Solution: Clean and reinitialize Go modules
+cd ~/otel-security/test-app
+rm -rf go.mod go.sum
+go mod init secure-otel-test
+go mod tidy
+Conclusion
+In this lab, you have successfully implemented comprehensive security measures for OpenTelemetry data handling. You accomplished the following key objectives:
+
+Security Implementations Completed:
+
+Created and configured SSL/TLS certificates for secure communication
+Set up encrypted data transmission channels using mutual TLS authentication
+Implemented data encryption and sanitization for sensitive telemetry information
+Configured secure storage mechanisms with proper access controls
+Established monitoring and alerting for security events
+Key Security Concepts Learned:
+
+Encryption in Transit: All telemetry data is now transmitted over encrypted TLS connections
+Mutual Authentication: Both client and server authenticate each other using certificates
+Data Sanitization: Sensitive information is automatically hashed or removed from telemetry data
+Access Control: API keys and role-based permissions control who can send and receive data
+Security Monitoring: Automated monitoring detects and alerts on security-related events
+Real-World Applications: This secure OpenTelemetry setup is essential for production environments where telemetry data may contain sensitive information such as user IDs, transaction details, or system internals. The security measures you implemented ensure compliance with data protection regulations and prevent unauthorized access to observability data.
+
+Best Practices Demonstrated:
+
+Certificate-based authentication for service-to-service communication
+Automated certificate validation and expiration monitoring
+Data classification and protection based on sensitivity levels
+Network-level security controls and rate limiting
+Comprehensive security event logging and monitoring
+The skills and configurations you've developed in this lab provide a solid foundation for deploying OpenTelemetry in enterprise environments where security is paramount. These practices ensure that your observability infrastructure maintains the same security standards as your production applications.

@@ -1,0 +1,60 @@
+receivers:
+  # Monitor the collector itself
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['localhost:8888']
+          scrape_interval: 30s
+          metrics_path: /metrics
+          scheme: http
+
+  # File log receiver for security logs
+  filelog:
+    include: ["/var/log/otel-security/*.log"]
+    operators:
+      - type: json_parser
+        id: json_parser
+        output: security_filter
+      - type: filter
+        id: security_filter
+        expr: 'body.level == "ERROR" or body.level == "WARN"'
+
+processors:
+  batch:
+    timeout: 30s
+    send_batch_size: 512
+
+  # Security-focused attribute processing
+  attributes:
+    actions:
+      - key: security.event
+        value: "telemetry_security_monitoring"
+        action: insert
+      - key: security.timestamp
+        from_attribute: timestamp
+        action: insert
+
+exporters:
+  # Security alerts file
+  file/security:
+    path: /data/security-alerts.json
+    rotation:
+      max_megabytes: 5
+      max_days: 30
+
+  logging:
+    loglevel: info
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [attributes, batch]
+      exporters: [file/security, logging]
+    
+    logs:
+      receivers: [filelog]
+      processors: [attributes, batch]
+      exporters: [file/security, logging]

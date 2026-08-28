@@ -1,0 +1,12 @@
+api_keys:
+  - key: "otel-producer-key-12345"
+    permissions: ["write:traces", "write:metrics", "write:logs"]
+    description: "Producer application key"
+  
+  - key: "otel-consumer-key-67890"
+    permissions: ["read:traces", "read:metrics", "read:logs"]
+    description: "Consumer application key"
+  
+  - key: "otel-admin-key-abcdef"
+    permissions: ["*"]
+    description: "Administrative access key"

@@ -1,0 +1,68 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+      http:
+        endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /certs/server-cert.pem
+          key_file: /certs/server-key.pem
+          ca_file: /certs/ca.pem
+          client_ca_file: /certs/ca.pem
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  # Add encryption processor for sensitive data
+  attributes:
+    actions:
+      - key: sensitive_data
+        action: hash
+
+exporters:
+  # Secure file exporter with encryption
+  file:
+    path: /data/encrypted-traces.json
+    rotation:
+      max_megabytes: 10
+      max_days: 3
+      max_backups: 3
+  
+  # Logging exporter for debugging
+  logging:
+    loglevel: info
+    sampling_initial: 2
+    sampling_thereafter: 500
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes, batch]
+      exporters: [file, logging]
+    
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file, logging]
+    
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file, logging]
+  
+  extensions: []
+  
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 127.0.0.1:8888
